@@ -3,6 +3,12 @@
   "displayName": "telemetry-logger",
   "description": "Captures coding behavior telemetry for AI detection",
   "version": "0.0.1",
+  "publisher": "mitsuha24",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Mitsuha-24/code-analyzer.git"
+  },
   "engines": {
     "vscode": "^1.125.0"
   },
@@ -16,10 +22,24 @@
   "contributes": {
     "commands": [
       {
-        "command": "telemetry-logger.helloWorld",
-        "title": "Hello World"
+        "command": "telemetryLogger.stopLogging",
+        "title": "Telemetry Logger: Stop Logging"
+      },
+      {
+        "command": "telemetryLogger.resumeLogging",
+        "title": "Telemetry Logger: Resume Logging"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Lab Telemetry Logger",
+      "properties": {
+        "telemetryLogger.serverUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Central collector endpoint, e.g. http://192.168.1.20:4000/ingest. Leave blank to log locally only."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
