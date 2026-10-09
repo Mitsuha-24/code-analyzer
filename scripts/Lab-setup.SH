@@ -20,3 +20,20 @@ echo "== Installing your telemetry logger =="
 code --install-extension ./lab-telemetry-logger.vsix
 
 echo "Done. Launch VS Code, open a folder, and set telemetryLogger.serverUrl in Settings."
+
+#set Server Url 
+cntl+shift+p -> Preferences: Open Settings (JSON) -> add the following line:
+"telemetryLogger.serverUrl": "http://localhost:4000/ingest" # for own server or to testing purpose 
+"telemetryLogger.serverUrl": "http://<LAN -IP of my laptop>:4000/ingest"  # for shared server
+# To retrive ip address of your laptop, run the following command in terminal:
+ipconfig
+
+#to delete the extension, run the following command in terminal:
+code --uninstall-extension mitsuha24.telemetry-logger
+
+# to delete the data collected by the extension, run the following command in terminal:
+Remove-Item "C:\Users\Anushka\AppData\Roaming\Code\User\globalStorage\mitsuha24.telemetry-logger\telemetry_session_log.jsonl"
+
+# to run the server, run the following command in terminal:
+ cd "D:\Code analyzer\telemetry-logger\server" 
+ node server.js

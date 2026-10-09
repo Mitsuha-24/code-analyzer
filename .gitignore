@@ -3,3 +3,7 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+server/.env
+server/lab_session_data
+server/snapshot_store
+

@@ -2,558 +2,2077 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
+import * as https from 'https';
+import { randomUUID } from 'crypto';
 
-// ─────────────────────────────────────────────────────────────────────────
-// CONFIG
-// ─────────────────────────────────────────────────────────────────────────
-const CAPTURE_TEXT_SNIPPETS = false;
-const FLUSH_INTERVAL_MS = 30_000; // write a summary every 30s instead of per-event
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
 
-const PASTE_CHAR_THRESHOLD = 15;        // insertions bigger than this get classified
-const EDIT_RATIO_WINDOW_MS = 3 * 60_000; // how long we keep watching a file after a paste
-const RUN_AFTER_PASTE_WINDOW_MS = 2 * 60_000; // "did they run it soon after pasting?"
-const FOCUS_LOSS_MIN_MS = 3_000;        // ignore blur/focus blips shorter than this
-const SERVER_POST_TIMEOUT_MS = 4_000;   // don't let a slow/dead server hang the extension
+const FLUSH_INTERVAL_MS = 60_000;
 
-let outputChannel: vscode.OutputChannel;
-let logFilePath: string;
-let flushTimer: NodeJS.Timeout;
-let studentId: string = 'unknown';
-let loggingActive: boolean = true; // toggled via "Telemetry Logger: Stop/Resume Logging" commands
+// Large insertions are tracked as INSERTION EVENTS.
+// They are NOT automatically considered AI-generated.
+const LARGE_INSERTION_THRESHOLD = 15;
 
-const lastEditTimestamp = new Map<string, number>();
+const EDIT_RATIO_WINDOW_MS = 3 * 60_000;
+const RUN_AFTER_INSERTION_WINDOW_MS = 2 * 60_000;
 
-let writeQueue: Promise<void> = Promise.resolve();
-function enqueueWrite(line: string) {
-    writeQueue = writeQueue
-        .then(() => fs.promises.appendFile(logFilePath, line + '\n'))
-        .catch((err) => outputChannel.appendLine(`[write error] ${err}`));
-}
+const FOCUS_LOSS_MIN_MS = 3_000;
+const SERVER_POST_TIMEOUT_MS = 4_000;
 
-// ── Paste-source classification ──
-// Scenario 3 vs 4: "copied from same file & tweaked" vs "copied from elsewhere & tweaked"
-// vs plain AI/external paste. We can't know for certain, but we can narrow it down.
-type PasteSource = 'same_file' | 'other_open_file' | 'external_clipboard' | 'unknown';
+// Maximum number of raw events retained in memory before a flush.
+const MAX_RAW_EVENTS_PER_WINDOW = 2_000;
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+type PasteSource =
+    | 'same_file'
+    | 'other_open_file'
+    | 'external_clipboard'
+    | 'unknown';
+
+type EventType =
+    | 'edit'
+    | 'large_insertion'
+    | 'deletion'
+    | 'save'
+    | 'tab_switch'
+    | 'debug_start'
+    | 'debug_end'
+    | 'task_start'
+    | 'terminal_run'
+    | 'git_commit'
+    | 'focus_loss'
+    | 'focus_gain'
+    | 'diagnostic_change';
 
 interface PasteEvent {
     source: PasteSource;
     length: number;
 }
 
-// Tracks "what happened after a paste landed in this file" so we can compute
-// an edit-ratio and a run-after-paste signal without doing precise range math
-// (ranges shift as the document changes, so we use a time-windowed approximation).
-interface PostPasteWatch {
+interface TelemetryEvent {
+    eventId: string;
+    sessionId: string;
+    timestamp: string;
+    eventType: EventType;
+
+    file?: string;
+    language?: string;
+
+    charsAdded?: number;
+    charsDeleted?: number;
+    changeCount?: number;
+
+    insertionSize?: number;
+    deletionSize?: number;
+
+    pasteSource?: PasteSource;
+
+    diagnosticsErrors?: number;
+    diagnosticsWarnings?: number;
+
+    durationMs?: number;
+}
+
+interface PostInsertionWatch {
     fileKey: string;
     timestamp: number;
-    pasteLength: number;
+    insertionLength: number;
     charsChangedSince: number;
 }
-const activePasteWatches = new Map<string, PostPasteWatch>(); // keyed by fileKey
-let lastPasteTimestamp = 0;
 
-// Focus-loss tracking — a weak proxy for "user looked away" (Scenario 1: phone-peeking).
-// We can't see the phone, but unusually long pauses combined with focus loss (e.g. tabbing
-// to a browser) is at least a signal worth feeding the model, even if imperfect.
-let windowFocused = true;
-let focusLostAt = 0;
-
-// ── Aggregate state — resets after every flush ──
 interface SessionStats {
     windowStart: string;
-    keystrokes: number;
+
+    // Editing
+    editEvents: number;
+    insertionEvents: number;
+    deletionEvents: number;
+    replacementEvents: number;
+
     charsAdded: number;
     charsDeleted: number;
-    pastesOrGenerated: number;
-    deletions: number;
-    tabSwitches: number;
-    fileSaves: number;
-    debugSessionsStarted: number;
-    debugSessionsEnded: number;
-    tasksRun: number;
-    gitCommits: number;
-    filesTouched: Set<string>;
+
+    largeInsertionCount: number;
+    largestInsertionSize: number;
+    largestDeletionSize: number;
+
+    totalInsertionSize: number;
+    totalDeletionSize: number;
+
+    // Timing
     totalPauseMs: number;
     pauseSamples: number;
 
-    // ── new: paste-source breakdown (Scenarios 3 & 4) ──
-    pasteEvents: PasteEvent[];
-    editRatiosPostPaste: number[]; // how much of a pasted block got reworked afterward
-    runsShortlyAfterPaste: number; // task/debug run within RUN_AFTER_PASTE_WINDOW_MS of a paste
+    activeCodingTimeMs: number;
+    idleTimeMs: number;
 
-    // ── new: focus-loss proxy (Scenario 1) ──
+    // Development workflow
+    tabSwitches: number;
+    fileSaves: number;
+
+    debugSessionsStarted: number;
+    debugSessionsEnded: number;
+
+    tasksRun: number;
+    terminalRuns: number;
+
+    gitCommits: number;
+
+    // Diagnostics
+    diagnosticEvents: number;
+    diagnosticErrorCount: number;
+    diagnosticWarningCount: number;
+
+    // Files / languages
+    filesTouched: Set<string>;
+    languagesUsed: Set<string>;
+
+    // Insertion / paste behavior
+    pasteEvents: PasteEvent[];
+    editRatiosPostInsertion: number[];
+    runsShortlyAfterInsertion: number;
+
+    // Focus behavior
     focusLossCount: number;
     totalFocusLossMs: number;
+
+    // Raw event sequence
+    rawEvents: TelemetryEvent[];
 }
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+let outputChannel: vscode.OutputChannel;
+
+let logFilePath = '';
+let eventLogFilePath = '';
+let snapshotLogFilePath = '';
+
+let flushTimer: NodeJS.Timeout | undefined;
+
+let studentId = 'unknown';
+let sessionId = '';
+
+let loggingActive = false;
+let consentGiven = false;
+
+let projectId = 'unknown';
+let taskId = 'unknown';
+
+const lastEditTimestamp = new Map<string, number>();
+
+let writeQueue: Promise<void> = Promise.resolve();
+
+const activeInsertionWatches = new Map<string, PostInsertionWatch>();
+
+let lastInsertionTimestamp = 0;
+
+let windowFocused = true;
+let focusLostAt = 0;
+
+// Current stats window.
+let stats = freshStats();
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+function generateSessionId(): string {
+    return `session-${Date.now()}-${randomUUID().slice(0, 8)}`;
+}
+
+function generateEventId(): string {
+    return randomUUID();
+}
+
+function average(values: number[]): number {
+    if (values.length === 0) {
+        return 0;
+    }
+
+    return Math.round(
+        (values.reduce((a, b) => a + b, 0) / values.length) * 100
+    ) / 100;
+}
+
+function median(values: number[]): number {
+    if (values.length === 0) {
+        return 0;
+    }
+
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+
+    if (sorted.length % 2 === 0) {
+        return Math.round(
+            ((sorted[middle - 1] + sorted[middle]) / 2) * 100
+        ) / 100;
+    }
+
+    return sorted[middle];
+}
+
+function languageFromDocument(document: vscode.TextDocument): string {
+    return document.languageId || 'unknown';
+}
+
+function fileNameFromDocument(document: vscode.TextDocument): string {
+    return path.basename(document.fileName);
+}
+
+function getProjectId(): string {
+    const folders = vscode.workspace.workspaceFolders;
+
+    if (!folders || folders.length === 0) {
+        return 'no-workspace';
+    }
+
+    // Use workspace name rather than an absolute path for privacy.
+    return folders.length === 1
+        ? folders[0].name
+        : folders.map((folder) => folder.name).join('|');
+}
+
+// ============================================================================
+// WRITE QUEUE
+// ============================================================================
+
+function enqueueWrite(filePath: string, line: string): void {
+    writeQueue = writeQueue
+        .then(() => fs.promises.appendFile(filePath, line + '\n'))
+        .catch((error) => {
+            if (outputChannel) {
+                outputChannel.appendLine(
+                    `[write error] ${error instanceof Error ? error.message : String(error)}`
+                );
+            }
+        });
+}
+
+// ============================================================================
+// RAW EVENT LOGGING
+// ============================================================================
+
+function recordEvent(event: Omit<TelemetryEvent, 'eventId' | 'sessionId'>): void {
+    if (!loggingActive || !consentGiven) {
+        return;
+    }
+
+    if (stats.rawEvents.length < MAX_RAW_EVENTS_PER_WINDOW) {
+        stats.rawEvents.push({
+            eventId: generateEventId(),
+            sessionId,
+            ...event
+        });
+    }
+}
+
+// ============================================================================
+// STATS
+// ============================================================================
 
 function freshStats(): SessionStats {
     return {
         windowStart: new Date().toISOString(),
-        keystrokes: 0,
+
+        editEvents: 0,
+        insertionEvents: 0,
+        deletionEvents: 0,
+        replacementEvents: 0,
+
         charsAdded: 0,
         charsDeleted: 0,
-        pastesOrGenerated: 0,
-        deletions: 0,
-        tabSwitches: 0,
-        fileSaves: 0,
-        debugSessionsStarted: 0,
-        debugSessionsEnded: 0,
-        tasksRun: 0,
-        gitCommits: 0,
-        filesTouched: new Set(),
+
+        largeInsertionCount: 0,
+        largestInsertionSize: 0,
+        largestDeletionSize: 0,
+
+        totalInsertionSize: 0,
+        totalDeletionSize: 0,
+
         totalPauseMs: 0,
         pauseSamples: 0,
+
+        activeCodingTimeMs: 0,
+        idleTimeMs: 0,
+
+        tabSwitches: 0,
+        fileSaves: 0,
+
+        debugSessionsStarted: 0,
+        debugSessionsEnded: 0,
+
+        tasksRun: 0,
+        terminalRuns: 0,
+
+        gitCommits: 0,
+
+        diagnosticEvents: 0,
+        diagnosticErrorCount: 0,
+        diagnosticWarningCount: 0,
+
+        filesTouched: new Set<string>(),
+        languagesUsed: new Set<string>(),
+
         pasteEvents: [],
-        editRatiosPostPaste: [],
-        runsShortlyAfterPaste: 0,
+        editRatiosPostInsertion: [],
+        runsShortlyAfterInsertion: 0,
+
         focusLossCount: 0,
         totalFocusLossMs: 0,
+
+        rawEvents: []
     };
 }
 
-let stats = freshStats();
+// ============================================================================
+// SERVER
+// ============================================================================
 
-// ── Send each flushed summary to a central collector over the lab LAN ──
-// Local file write always still happens as a backup — this is best-effort on top of it.
 function getServerUrl(): string | undefined {
-    const configured = vscode.workspace.getConfiguration('telemetryLogger').get<string>('serverUrl');
-    return configured && configured.trim().length > 0 ? configured.trim() : undefined;
+    const configured =
+        vscode.workspace
+            .getConfiguration('telemetryLogger')
+            .get<string>('serverUrl');
+
+    if (!configured || configured.trim().length === 0) {
+        return undefined;
+    }
+
+    return configured.trim();
 }
 
-function postToServer(jsonPayload: string) {
+function postToServer(jsonPayload: string): void {
     const url = getServerUrl();
-    if (!url) return; // no server configured — local file only
 
-    let parsed: URL;
-    try {
-        parsed = new URL(url);
-    } catch {
-        outputChannel.appendLine(`[server] invalid serverUrl setting: ${url}`);
+    if (!url) {
         return;
     }
 
-    const req = http.request(
+    let parsed: URL;
+
+    try {
+        parsed = new URL(url);
+    } catch {
+        outputChannel.appendLine(
+            `[server] invalid serverUrl setting: ${url}`
+        );
+        return;
+    }
+
+    const isHttps = parsed.protocol === 'https:';
+
+    // Pick the transport that actually matches the collector URL's scheme.
+    // Using http.request against an https:// URL silently fails (connection
+    // reset / protocol mismatch) rather than throwing something obvious, so
+    // this branch matters even though the two request signatures are nearly
+    // identical.
+    const client = isHttps ? https : http;
+
+    const req = client.request(
         {
             hostname: parsed.hostname,
-            port: parsed.port || 80,
+            port: parsed.port || (isHttps ? 443 : 80),
             path: parsed.pathname || '/ingest',
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            timeout: SERVER_POST_TIMEOUT_MS,
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(jsonPayload)
+            },
+            timeout: SERVER_POST_TIMEOUT_MS
         },
         (res) => {
-            res.resume(); // drain response, we don't need the body
+            res.resume();
+
             if (res.statusCode && res.statusCode >= 400) {
-                outputChannel.appendLine(`[server] ingest rejected: HTTP ${res.statusCode}`);
+                outputChannel.appendLine(
+                    `[server] ingest rejected: HTTP ${res.statusCode}`
+                );
             }
         }
     );
 
-    req.on('timeout', () => req.destroy());
-    req.on('error', (err) => {
-        // lab wifi drops, server not running yet, etc. — don't crash, local file still has it
-        outputChannel.appendLine(`[server] post failed (kept locally): ${err.message}`);
+    req.on('timeout', () => {
+        req.destroy();
+    });
+
+    req.on('error', (error) => {
+        outputChannel.appendLine(
+            `[server] post failed (kept locally): ${error.message}`
+        );
     });
 
     req.write(jsonPayload);
     req.end();
 }
 
-function average(nums: number[]): number {
-    if (nums.length === 0) return 0;
-    return Math.round((nums.reduce((a, b) => a + b, 0) / nums.length) * 100) / 100;
+// ============================================================================
+// CODE SNAPSHOTS
+//
+// Behavioral telemetry alone can't feed the Source Code Analysis stage of
+// the pipeline (AST structure, static metrics, per-session code history).
+// This section adds that missing data source.
+//
+// Deliberately NOT interval-based: capturing full file content every flush
+// (60s) would multiply payload size and disk/network load for little gain,
+// since code changes far less often than behavioral events fire. Instead,
+// snapshots are taken at natural checkpoints:
+//   - 'save'                on every file save (already-logged event)
+//   - 'file_close'           when a file is closed (catches unsaved edits
+//                             right before a window/editor close, which is
+//                             the main risk of losing the true final state)
+//   - 'session_stop'         when the user runs "Stop Logging"
+//   - 'session_deactivate'   on extension deactivate, as a last-resort net
+//
+// Together these guarantee the final submitted code is captured even if the
+// student never explicitly stops logging or saves immediately before
+// closing the window.
+// ============================================================================
+
+type SnapshotTrigger =
+    | 'save'
+    | 'file_close'
+    | 'session_stop'
+    | 'session_deactivate';
+
+function buildSnapshotPayload(
+    document: vscode.TextDocument,
+    trigger: SnapshotTrigger
+): string {
+    return JSON.stringify({
+        schemaVersion: '2.0',
+        payloadType: 'code_snapshot',
+
+        sessionId,
+        studentId,
+
+        projectId,
+        taskId,
+
+        machineId: vscode.env.machineId,
+
+        timestamp: new Date().toISOString(),
+        trigger,
+
+        file: fileNameFromDocument(document),
+        language: languageFromDocument(document),
+
+        content: document.getText()
+    });
 }
 
-function flushStats(reason: string) {
-    // settle any post-paste watches that have expired before we summarize
-    settleExpiredPasteWatches();
-
-    if (
-        stats.keystrokes === 0 &&
-        stats.tabSwitches === 0 &&
-        stats.fileSaves === 0 &&
-        stats.debugSessionsStarted === 0 &&
-        stats.tasksRun === 0 &&
-        stats.gitCommits === 0 &&
-        stats.pasteEvents.length === 0 &&
-        stats.focusLossCount === 0
-    ) {
-        return; // nothing happened this window — skip empty summaries
+function captureCodeSnapshot(
+    document: vscode.TextDocument,
+    trigger: SnapshotTrigger
+): void {
+    if (!consentGiven || document.uri.scheme !== 'file') {
+        return;
     }
 
-    const pasteBySource = { same_file: 0, other_open_file: 0, external_clipboard: 0, unknown: 0 };
-    stats.pasteEvents.forEach((p) => pasteBySource[p.source]++);
+    if (!snapshotLogFilePath) {
+        return;
+    }
 
-    const summary = {
-        studentId,
-        machineId: vscode.env.machineId,
-        windowStart: stats.windowStart,
-        windowEnd: new Date().toISOString(),
-        reason,
-        keystrokes: stats.keystrokes,
-        charsAdded: stats.charsAdded,
-        charsDeleted: stats.charsDeleted,
-        pastesOrGenerated: stats.pastesOrGenerated,
-        deletions: stats.deletions,
-        tabSwitches: stats.tabSwitches,
-        fileSaves: stats.fileSaves,
-        debugSessionsStarted: stats.debugSessionsStarted,
-        debugSessionsEnded: stats.debugSessionsEnded,
-        tasksRun: stats.tasksRun,
-        gitCommits: stats.gitCommits,
-        filesTouched: Array.from(stats.filesTouched),
-        avgPauseMs:
-            stats.pauseSamples > 0 ? Math.round(stats.totalPauseMs / stats.pauseSamples) : 0,
+    const jsonString = buildSnapshotPayload(document, trigger);
 
-        // paste-source breakdown — helps separate self-copy (3/4) from external/AI paste
-        pasteSourceBreakdown: pasteBySource,
-        avgEditRatioPostPaste: average(stats.editRatiosPostPaste), // ~0 = left as-is, higher = reworked
-        runsShortlyAfterPaste: stats.runsShortlyAfterPaste,
+    // Session-ending triggers get a synchronous local write in addition to
+    // (not instead of) the network post: the extension host can be torn
+    // down moments after deactivate() / a window close, before the async
+    // write queue or an in-flight HTTP request would otherwise finish. A
+    // synchronous append guarantees the snapshot survives on disk even if
+    // the network call never completes.
+    if (
+        trigger === 'session_stop' ||
+        trigger === 'session_deactivate' ||
+        trigger === 'file_close'
+    ) {
+        try {
+            fs.appendFileSync(
+                snapshotLogFilePath,
+                jsonString + '\n'
+            );
+        } catch (error) {
+            if (outputChannel) {
+                outputChannel.appendLine(
+                    `[snapshot write error] ${error instanceof Error ? error.message : String(error)}`
+                );
+            }
+        }
+    } else {
+        enqueueWrite(snapshotLogFilePath, jsonString);
+    }
 
-        // focus-loss proxy — weak signal for "looked away" (phone, another window, etc.)
-        focusLossCount: stats.focusLossCount,
-        avgFocusLossMs:
-            stats.focusLossCount > 0 ? Math.round(stats.totalFocusLossMs / stats.focusLossCount) : 0,
-    };
-
-    const jsonString = JSON.stringify(summary);
-    outputChannel.appendLine(jsonString);
-    enqueueWrite(jsonString);
     postToServer(jsonString);
-
-    stats = freshStats();
 }
 
-// ── Classify where a large insertion likely came from ──
-// Best-effort only: VS Code doesn't expose "this was a paste from X", so we infer it
-// by checking whether the inserted text already exists elsewhere (same file / other
-// open file) or matches the current clipboard (external source, origin unknown).
+function captureAllOpenDocuments(trigger: SnapshotTrigger): void {
+    for (const document of vscode.workspace.textDocuments) {
+        captureCodeSnapshot(document, trigger);
+    }
+}
+
+// ============================================================================
+// INSERTION SOURCE CLASSIFICATION
+// ============================================================================
+
+/**
+ * This is deliberately called "paste source classification".
+ *
+ * IMPORTANT:
+ * An external clipboard does NOT mean AI-generated.
+ * It may be ChatGPT, a browser, documentation, another project, etc.
+ */
 async function classifyPasteSource(
     document: vscode.TextDocument,
     insertedText: string,
     insertOffset: number
 ): Promise<PasteSource> {
     const needle = insertedText.trim();
-    if (needle.length < PASTE_CHAR_THRESHOLD) return 'unknown';
 
-    // 1. Does this text already exist elsewhere in the SAME file (outside where it landed)?
+    if (needle.length < LARGE_INSERTION_THRESHOLD) {
+        return 'unknown';
+    }
+
+    // ---------------------------------------------------------
+    // 1. Same file
+    // ---------------------------------------------------------
+
     const fullText = document.getText();
+
     const before = fullText.slice(0, insertOffset);
-    const after = fullText.slice(insertOffset + insertedText.length);
+    const after = fullText.slice(
+        insertOffset + insertedText.length
+    );
+
     if (before.includes(needle) || after.includes(needle)) {
         return 'same_file';
     }
 
-    // 2. Does it exist in another currently-open document?
+    // ---------------------------------------------------------
+    // 2. Other currently-open file
+    // ---------------------------------------------------------
+
     for (const doc of vscode.workspace.textDocuments) {
-        if (doc.uri.toString() === document.uri.toString()) continue;
-        if (doc.getText().includes(needle)) {
-            return 'other_open_file';
+        if (doc.uri.toString() === document.uri.toString()) {
+            continue;
+        }
+
+        try {
+            if (doc.getText().includes(needle)) {
+                return 'other_open_file';
+            }
+        } catch {
+            // Ignore inaccessible documents.
         }
     }
 
-    // 3. Does it match the current clipboard? (confirms a paste happened; origin unknown
-    //    beyond that — could be AI-tool output, browser, another project, etc.)
+    // ---------------------------------------------------------
+    // 3. Clipboard
+    // ---------------------------------------------------------
+
     try {
-        const clip = (await vscode.env.clipboard.readText()).trim();
-        if (clip.length > 0 && (clip === needle || clip.includes(needle) || needle.includes(clip))) {
+        const clipboard = (
+            await vscode.env.clipboard.readText()
+        ).trim();
+
+        if (
+            clipboard.length > 0 &&
+            (
+                clipboard === needle ||
+                clipboard.includes(needle) ||
+                needle.includes(clipboard)
+            )
+        ) {
             return 'external_clipboard';
         }
     } catch {
-        // clipboard read can fail (permissions, empty, etc.) — fall through
+        // Clipboard access may fail.
     }
 
     return 'unknown';
 }
 
-// ── Track what happens to a pasted block afterward (edit ratio + run-after-paste) ──
-function startPostPasteWatch(fileKey: string, pasteLength: number, timestamp: number) {
-    activePasteWatches.set(fileKey, {
+// ============================================================================
+// POST-INSERTION ANALYSIS
+// ============================================================================
+
+function startPostInsertionWatch(
+    fileKey: string,
+    insertionLength: number,
+    timestamp: number
+): void {
+    activeInsertionWatches.set(fileKey, {
         fileKey,
         timestamp,
-        pasteLength,
-        charsChangedSince: 0,
+        insertionLength,
+        charsChangedSince: 0
     });
-    lastPasteTimestamp = timestamp;
+
+    lastInsertionTimestamp = timestamp;
 }
 
-function recordPostPasteEdit(fileKey: string, charsChanged: number) {
-    const watch = activePasteWatches.get(fileKey);
-    if (!watch) return;
-    if (Date.now() - watch.timestamp > EDIT_RATIO_WINDOW_MS) {
-        settleWatch(fileKey);
+function recordPostInsertionEdit(
+    fileKey: string,
+    charsChanged: number
+): void {
+    const watch = activeInsertionWatches.get(fileKey);
+
+    if (!watch) {
         return;
     }
+
+    if (Date.now() - watch.timestamp > EDIT_RATIO_WINDOW_MS) {
+        settleInsertionWatch(fileKey);
+        return;
+    }
+
     watch.charsChangedSince += charsChanged;
 }
 
-function settleWatch(fileKey: string) {
-    const watch = activePasteWatches.get(fileKey);
-    if (!watch) return;
-    const ratio = watch.pasteLength > 0 ? watch.charsChangedSince / watch.pasteLength : 0;
-    stats.editRatiosPostPaste.push(Math.round(ratio * 100) / 100);
-    activePasteWatches.delete(fileKey);
+function settleInsertionWatch(fileKey: string): void {
+    const watch = activeInsertionWatches.get(fileKey);
+
+    if (!watch) {
+        return;
+    }
+
+    const ratio =
+        watch.insertionLength > 0
+            ? watch.charsChangedSince / watch.insertionLength
+            : 0;
+
+    stats.editRatiosPostInsertion.push(
+        Math.round(ratio * 100) / 100
+    );
+
+    activeInsertionWatches.delete(fileKey);
 }
 
-function settleExpiredPasteWatches() {
+function settleExpiredInsertionWatches(): void {
     const now = Date.now();
-    for (const [fileKey, watch] of activePasteWatches) {
-        if (now - watch.timestamp > EDIT_RATIO_WINDOW_MS) {
-            settleWatch(fileKey);
+
+    for (const [fileKey, watch] of activeInsertionWatches) {
+        if (
+            now - watch.timestamp >
+            EDIT_RATIO_WINDOW_MS
+        ) {
+            settleInsertionWatch(fileKey);
         }
     }
 }
 
-function noteRunEvent() {
-    if (lastPasteTimestamp === 0) return;
-    if (Date.now() - lastPasteTimestamp <= RUN_AFTER_PASTE_WINDOW_MS) {
-        stats.runsShortlyAfterPaste += 1;
+function noteRunEvent(): void {
+    if (lastInsertionTimestamp === 0) {
+        return;
+    }
+
+    if (
+        Date.now() - lastInsertionTimestamp <=
+        RUN_AFTER_INSERTION_WINDOW_MS
+    ) {
+        stats.runsShortlyAfterInsertion += 1;
     }
 }
 
-async function resolveStudentId(context: vscode.ExtensionContext): Promise<string> {
-    const stored = context.globalState.get<string>('telemetryLogger.studentId');
-    if (stored && stored.trim().length > 0) return stored;
+// ============================================================================
+// STUDENT / CONSENT
+// ============================================================================
+
+async function requestConsent(
+    context: vscode.ExtensionContext
+): Promise<boolean> {
+    const storedConsent =
+        context.globalState.get<boolean>(
+            'telemetryLogger.consent'
+        );
+
+    if (storedConsent === true) {
+        return true;
+    }
+
+    const result = await vscode.window.showInformationMessage(
+        'Telemetry Logger collects coding-behavior metadata such as edit counts, timing, execution, debugging, Git activity, and focus changes. It also captures snapshots of your source code file content — when you save a file, close a file, and when logging stops or ends — to support code-structure analysis for the research project. Do you consent to telemetry and code-snapshot collection for the research project?',
+        {
+            modal: true
+        },
+        'Allow',
+        'Decline'
+    );
+
+    if (result !== 'Allow') {
+        await context.globalState.update(
+            'telemetryLogger.consent',
+            false
+        );
+
+        return false;
+    }
+
+    await context.globalState.update(
+        'telemetryLogger.consent',
+        true
+    );
+
+    return true;
+}
+
+async function resolveStudentId(
+    context: vscode.ExtensionContext
+): Promise<string> {
+    const stored =
+        context.globalState.get<string>(
+            'telemetryLogger.studentId'
+        );
+
+    if (stored && stored.trim().length > 0) {
+        return stored;
+    }
 
     const entered = await vscode.window.showInputBox({
         title: 'Lab Telemetry Logger',
-        prompt: 'Enter your roll number / student ID (asked once per machine)',
+        prompt:
+            'Enter your research participant ID / student ID',
         ignoreFocusOut: true,
-        validateInput: (v) => (v.trim().length === 0 ? 'Required' : null),
+        password: false,
+        validateInput: (value) => {
+            return value.trim().length === 0
+                ? 'Participant ID is required'
+                : null;
+        }
     });
 
-    const id = entered && entered.trim().length > 0 ? entered.trim() : `anon-${Date.now()}`;
-    await context.globalState.update('telemetryLogger.studentId', id);
+    const id =
+        entered && entered.trim().length > 0
+            ? entered.trim()
+            : `anon-${Date.now()}`;
+
+    await context.globalState.update(
+        'telemetryLogger.studentId',
+        id
+    );
+
     return id;
 }
 
-export async function activate(context: vscode.ExtensionContext) {
-    outputChannel = vscode.window.createOutputChannel('Telemetry Logger');
-    outputChannel.appendLine('--- Telemetry Logger Activated ---');
+async function resolveTaskId(): Promise<string> {
+    const configured =
+        vscode.workspace
+            .getConfiguration('telemetryLogger')
+            .get<string>('taskId');
 
-    studentId = await resolveStudentId(context);
-    outputChannel.appendLine(`Logging as: ${studentId}`);
+    if (configured && configured.trim().length > 0) {
+        return configured.trim();
+    }
 
-    const storagePath = context.globalStorageUri.fsPath;
+    // Do not force the student to enter a task every time.
+    // "unknown" can later be assigned during controlled experiments.
+    return 'unknown';
+}
+
+// ============================================================================
+// FLUSH
+// ============================================================================
+
+function flushStats(reason: string): void {
+    if (!loggingActive || !consentGiven) {
+        return;
+    }
+
+    settleExpiredInsertionWatches();
+
+    const hasActivity =
+        stats.editEvents > 0 ||
+        stats.tabSwitches > 0 ||
+        stats.fileSaves > 0 ||
+        stats.debugSessionsStarted > 0 ||
+        stats.tasksRun > 0 ||
+        stats.terminalRuns > 0 ||
+        stats.gitCommits > 0 ||
+        stats.largeInsertionCount > 0 ||
+        stats.focusLossCount > 0 ||
+        stats.diagnosticEvents > 0 ||
+        stats.rawEvents.length > 0;
+
+    if (!hasActivity) {
+        return;
+    }
+
+    const pasteBySource = {
+        same_file: 0,
+        other_open_file: 0,
+        external_clipboard: 0,
+        unknown: 0
+    };
+
+    stats.pasteEvents.forEach((paste) => {
+        pasteBySource[paste.source]++;
+    });
+
+    const now = new Date();
+
+    const windowDurationMs =
+        now.getTime() -
+        new Date(stats.windowStart).getTime();
+
+    const avgPauseMs =
+        stats.pauseSamples > 0
+            ? Math.round(
+                stats.totalPauseMs /
+                stats.pauseSamples
+            )
+            : 0;
+
+    const avgInsertionSize =
+        stats.insertionEvents > 0
+            ? Math.round(
+                stats.totalInsertionSize /
+                stats.insertionEvents *
+                100
+            ) / 100
+            : 0;
+
+    const avgDeletionSize =
+        stats.deletionEvents > 0
+            ? Math.round(
+                stats.totalDeletionSize /
+                stats.deletionEvents *
+                100
+            ) / 100
+            : 0;
+
+    const summary = {
+        schemaVersion: '2.0',
+
+        sessionId,
+        studentId,
+
+        projectId,
+        taskId,
+
+        machineId: vscode.env.machineId,
+
+        windowStart: stats.windowStart,
+        windowEnd: now.toISOString(),
+
+        windowDurationMs,
+
+        reason,
+
+        // ---------------------------------------------------------
+        // Editing behavior
+        // ---------------------------------------------------------
+
+        editEvents: stats.editEvents,
+        insertionEvents: stats.insertionEvents,
+        deletionEvents: stats.deletionEvents,
+        replacementEvents: stats.replacementEvents,
+
+        charsAdded: stats.charsAdded,
+        charsDeleted: stats.charsDeleted,
+
+        largeInsertionCount:
+            stats.largeInsertionCount,
+
+        largestInsertionSize:
+            stats.largestInsertionSize,
+
+        largestDeletionSize:
+            stats.largestDeletionSize,
+
+        avgInsertionSize,
+        avgDeletionSize,
+
+        // ---------------------------------------------------------
+        // Timing behavior
+        // ---------------------------------------------------------
+
+        avgPauseMs,
+
+        medianPauseMs: median(
+            collectPauseSamples()
+        ),
+
+        activeCodingTimeMs:
+            stats.activeCodingTimeMs,
+
+        idleTimeMs:
+            stats.idleTimeMs,
+
+        // ---------------------------------------------------------
+        // Development workflow
+        // ---------------------------------------------------------
+
+        tabSwitches:
+            stats.tabSwitches,
+
+        fileSaves:
+            stats.fileSaves,
+
+        debugSessionsStarted:
+            stats.debugSessionsStarted,
+
+        debugSessionsEnded:
+            stats.debugSessionsEnded,
+
+        tasksRun:
+            stats.tasksRun,
+
+        terminalRuns:
+            stats.terminalRuns,
+
+        gitCommits:
+            stats.gitCommits,
+
+        // ---------------------------------------------------------
+        // Diagnostics
+        // ---------------------------------------------------------
+
+        diagnosticEvents:
+            stats.diagnosticEvents,
+
+        diagnosticErrorCount:
+            stats.diagnosticErrorCount,
+
+        diagnosticWarningCount:
+            stats.diagnosticWarningCount,
+
+        // ---------------------------------------------------------
+        // Context
+        // ---------------------------------------------------------
+
+        filesTouched:
+            Array.from(stats.filesTouched),
+
+        languagesUsed:
+            Array.from(stats.languagesUsed),
+
+        // ---------------------------------------------------------
+        // Insertion / paste behavior
+        // ---------------------------------------------------------
+
+        pasteSourceBreakdown:
+            pasteBySource,
+
+        avgEditRatioPostInsertion:
+            average(
+                stats.editRatiosPostInsertion
+            ),
+
+        runsShortlyAfterInsertion:
+            stats.runsShortlyAfterInsertion,
+
+        // ---------------------------------------------------------
+        // Focus behavior
+        // ---------------------------------------------------------
+
+        focusLossCount:
+            stats.focusLossCount,
+
+        avgFocusLossMs:
+            stats.focusLossCount > 0
+                ? Math.round(
+                    stats.totalFocusLossMs /
+                    stats.focusLossCount
+                )
+                : 0,
+
+        // ---------------------------------------------------------
+        // Ground truth
+        //
+        // IMPORTANT:
+        // These are intentionally "unknown" here.
+        // They should be assigned by the controlled dataset
+        // collection process rather than guessed by telemetry.
+        // ---------------------------------------------------------
+
+        aiUsage: 'unknown',
+        aiTool: 'unknown',
+        aiAssistanceLevel: 'unknown',
+
+        // ---------------------------------------------------------
+        // Event sequence
+        // ---------------------------------------------------------
+
+        eventCount:
+            stats.rawEvents.length,
+
+        events:
+            stats.rawEvents
+    };
+
+    const jsonString = JSON.stringify(summary);
+
+    outputChannel.appendLine(
+        `[telemetry] ${summary.windowStart} -> ${summary.windowEnd}`
+    );
+
+    enqueueWrite(
+        logFilePath,
+        jsonString
+    );
+
+    postToServer(jsonString);
+
+    stats = freshStats();
+}
+
+// ============================================================================
+// PAUSE SAMPLE STORAGE
+// ============================================================================
+
+// The original logger calculated average pauses but did not retain the
+// individual pause values. Keeping a small sample makes median calculation
+// possible without storing unlimited timing information.
+
+let pauseSamplesForMedian: number[] = [];
+
+function addPauseSample(value: number): void {
+    // Prevent unreasonable values from dominating the research features.
+    const clamped = Math.min(
+        Math.max(value, 0),
+        30 * 60 * 1000
+    );
+
+    pauseSamplesForMedian.push(clamped);
+
+    // Keep only the latest 500 samples in the current window.
+    if (pauseSamplesForMedian.length > 500) {
+        pauseSamplesForMedian =
+            pauseSamplesForMedian.slice(-500);
+    }
+}
+
+function collectPauseSamples(): number[] {
+    return [...pauseSamplesForMedian];
+}
+
+// ============================================================================
+// DIAGNOSTICS
+// ============================================================================
+
+function collectDiagnosticsForDocument(
+    document: vscode.TextDocument
+): void {
+    const diagnostics =
+        vscode.languages.getDiagnostics(
+            document.uri
+        );
+
+    let errors = 0;
+    let warnings = 0;
+
+    for (const diagnostic of diagnostics) {
+        if (
+            diagnostic.severity ===
+            vscode.DiagnosticSeverity.Error
+        ) {
+            errors++;
+        } else if (
+            diagnostic.severity ===
+            vscode.DiagnosticSeverity.Warning
+        ) {
+            warnings++;
+        }
+    }
+
+    stats.diagnosticEvents++;
+    stats.diagnosticErrorCount += errors;
+    stats.diagnosticWarningCount += warnings;
+
+    recordEvent({
+        timestamp: new Date().toISOString(),
+        eventType: 'diagnostic_change',
+        file: fileNameFromDocument(document),
+        language: languageFromDocument(document),
+        diagnosticsErrors: errors,
+        diagnosticsWarnings: warnings
+    });
+}
+
+// ============================================================================
+// ACTIVATION
+// ============================================================================
+
+export async function activate(
+    context: vscode.ExtensionContext
+): Promise<void> {
+    outputChannel =
+        vscode.window.createOutputChannel(
+            'Telemetry Logger'
+        );
+
+    outputChannel.appendLine(
+        '--- Telemetry Logger Activated ---'
+    );
+
+    // ---------------------------------------------------------
+    // Consent
+    // ---------------------------------------------------------
+
+    consentGiven =
+        await requestConsent(context);
+
+    if (!consentGiven) {
+        outputChannel.appendLine(
+            '--- Telemetry collection declined ---'
+        );
+
+        vscode.window.showInformationMessage(
+            'Telemetry Logger: collection is disabled.'
+        );
+
+        return;
+    }
+
+    // ---------------------------------------------------------
+    // Session
+    // ---------------------------------------------------------
+
+    sessionId = generateSessionId();
+
+    studentId =
+        await resolveStudentId(context);
+
+    projectId =
+        getProjectId();
+
+    taskId =
+        await resolveTaskId();
+
+    loggingActive = true;
+
+    outputChannel.appendLine(
+        `Session ID: ${sessionId}`
+    );
+
+    outputChannel.appendLine(
+        `Participant ID: ${studentId}`
+    );
+
+    outputChannel.appendLine(
+        `Project ID: ${projectId}`
+    );
+
+    outputChannel.appendLine(
+        `Task ID: ${taskId}`
+    );
+
+    // ---------------------------------------------------------
+    // Storage
+    // ---------------------------------------------------------
+
+    const storagePath =
+        context.globalStorageUri.fsPath;
+
     if (!fs.existsSync(storagePath)) {
-        fs.mkdirSync(storagePath, { recursive: true });
+        fs.mkdirSync(storagePath, {
+            recursive: true
+        });
     }
-    logFilePath = path.join(storagePath, 'telemetry_session_log.jsonl');
-    outputChannel.appendLine(`Logs saving to: ${logFilePath}`);
 
-    // Flush aggregated stats on a timer instead of logging every event
-    flushTimer = setInterval(() => flushStats('interval'), FLUSH_INTERVAL_MS);
+    logFilePath = path.join(
+        storagePath,
+        'telemetry_session_log.jsonl'
+    );
 
-    // ── LISTENER 1: Document Text Edits ──
-    const docChangeListener = vscode.workspace.onDidChangeTextDocument((event) => {
-        if (!loggingActive) {
-            return;
-        }
-        if (event.document.uri.scheme !== 'file') {
-            return;
-        }
+    eventLogFilePath = path.join(
+        storagePath,
+        'telemetry_event_log.jsonl'
+    );
 
-        const key = event.document.uri.toString();
-        const currentTime = Date.now();
-        const pauseDurationMs = currentTime - (lastEditTimestamp.get(key) ?? currentTime);
-        lastEditTimestamp.set(key, currentTime);
+    snapshotLogFilePath = path.join(
+        storagePath,
+        'telemetry_code_snapshots.jsonl'
+    );
 
-        const fileName = path.basename(event.document.fileName);
-        stats.filesTouched.add(fileName);
+    outputChannel.appendLine(
+        `Summary logs: ${logFilePath}`
+    );
 
-        event.contentChanges.forEach((change) => {
-            const charsAdded = change.text.length;
-            const charsDeleted = change.rangeLength;
+    outputChannel.appendLine(
+        `Event logs: ${eventLogFilePath}`
+    );
 
-            if (charsAdded === 0 && charsDeleted === 0) {
-                return;
-            }
+    outputChannel.appendLine(
+        `Snapshot logs: ${snapshotLogFilePath}`
+    );
 
-            stats.charsAdded += charsAdded;
-            stats.charsDeleted += charsDeleted;
-            stats.totalPauseMs += pauseDurationMs;
-            stats.pauseSamples += 1;
+    // ---------------------------------------------------------
+    // Periodic flush
+    // ---------------------------------------------------------
 
-            // If this file has an active post-paste watch, count this edit toward
-            // the "how much did they rework it" ratio (Scenarios 3 & 4).
-            recordPostPasteEdit(key, charsAdded + charsDeleted);
+    flushTimer = setInterval(
+        () => {
+            flushStats('interval');
+        },
+        FLUSH_INTERVAL_MS
+    );
 
-            if (charsAdded > 10) {
-                stats.pastesOrGenerated += 1;
+    // ========================================================================
+    // LISTENER 1: DOCUMENT EDITS
+    // ========================================================================
 
-                if (charsAdded >= PASTE_CHAR_THRESHOLD) {
-                    const insertOffset = event.document.offsetAt(change.range.start);
-                    const insertedText = change.text;
-                    classifyPasteSource(event.document, insertedText, insertOffset)
-                        .then((source) => {
-                            stats.pasteEvents.push({ source, length: charsAdded });
-                        })
-                        .catch(() => {
-                            stats.pasteEvents.push({ source: 'unknown', length: charsAdded });
-                        });
-                    startPostPasteWatch(key, charsAdded, currentTime);
+    const docChangeListener =
+        vscode.workspace.onDidChangeTextDocument(
+            (event) => {
+                if (!loggingActive) {
+                    return;
                 }
-            } else if (charsDeleted > 0 && charsAdded === 0) {
-                stats.deletions += 1;
-            } else {
-                stats.keystrokes += 1;
+
+                if (
+                    event.document.uri.scheme !==
+                    'file'
+                ) {
+                    return;
+                }
+
+                const key =
+                    event.document.uri.toString();
+
+                const currentTime =
+                    Date.now();
+
+                const previousTime =
+                    lastEditTimestamp.get(
+                        key
+                    );
+
+                const pauseDurationMs =
+                    previousTime === undefined
+                        ? 0
+                        : currentTime -
+                        previousTime;
+
+                lastEditTimestamp.set(
+                    key,
+                    currentTime
+                );
+
+                const fileName =
+                    fileNameFromDocument(
+                        event.document
+                    );
+
+                const language =
+                    languageFromDocument(
+                        event.document
+                    );
+
+                stats.filesTouched.add(
+                    fileName
+                );
+
+                stats.languagesUsed.add(
+                    language
+                );
+
+                if (pauseDurationMs > 0) {
+                    stats.totalPauseMs +=
+                        pauseDurationMs;
+
+                    stats.pauseSamples += 1;
+
+                    addPauseSample(
+                        pauseDurationMs
+                    );
+
+                    // We treat pauses over 5 minutes as idle
+                    // time rather than active coding time.
+                    if (
+                        pauseDurationMs >
+                        5 * 60 * 1000
+                    ) {
+                        stats.idleTimeMs +=
+                            pauseDurationMs;
+                    } else {
+                        stats.activeCodingTimeMs +=
+                            pauseDurationMs;
+                    }
+                }
+
+                event.contentChanges.forEach(
+                    (change) => {
+                        const charsAdded =
+                            change.text.length;
+
+                        const charsDeleted =
+                            change.rangeLength;
+
+                        if (
+                            charsAdded === 0 &&
+                            charsDeleted === 0
+                        ) {
+                            return;
+                        }
+
+                        stats.editEvents++;
+
+                        stats.charsAdded +=
+                            charsAdded;
+
+                        stats.charsDeleted +=
+                            charsDeleted;
+
+                        stats.totalInsertionSize +=
+                            charsAdded;
+
+                        stats.totalDeletionSize +=
+                            charsDeleted;
+
+                        if (
+                            charsAdded > 0 &&
+                            charsDeleted > 0
+                        ) {
+                            stats.replacementEvents++;
+                        } else if (
+                            charsAdded > 0
+                        ) {
+                            stats.insertionEvents++;
+                        } else if (
+                            charsDeleted > 0
+                        ) {
+                            stats.deletionEvents++;
+                        }
+
+                        stats.largestInsertionSize =
+                            Math.max(
+                                stats.largestInsertionSize,
+                                charsAdded
+                            );
+
+                        stats.largestDeletionSize =
+                            Math.max(
+                                stats.largestDeletionSize,
+                                charsDeleted
+                            );
+
+                        recordPostInsertionEdit(
+                            key,
+                            charsAdded +
+                            charsDeleted
+                        );
+
+                        // -----------------------------------------------------
+                        // Large insertion
+                        // -----------------------------------------------------
+
+                        if (
+                            charsAdded >=
+                            LARGE_INSERTION_THRESHOLD
+                        ) {
+                            stats.largeInsertionCount++;
+
+                            const insertOffset =
+                                event.document.offsetAt(
+                                    change.range.start
+                                );
+
+                            const insertedText =
+                                change.text;
+
+                            startPostInsertionWatch(
+                                key,
+                                charsAdded,
+                                currentTime
+                            );
+
+                            // We only classify the source.
+                            // We DO NOT classify it as AI.
+                            classifyPasteSource(
+                                event.document,
+                                insertedText,
+                                insertOffset
+                            )
+                                .then((source) => {
+                                    stats.pasteEvents.push(
+                                        {
+                                            source,
+                                            length:
+                                                charsAdded
+                                        }
+                                    );
+                                })
+                                .catch(() => {
+                                    stats.pasteEvents.push(
+                                        {
+                                            source:
+                                                'unknown',
+                                            length:
+                                                charsAdded
+                                        }
+                                    );
+                                });
+
+                            recordEvent({
+                                timestamp:
+                                    new Date().toISOString(),
+                                eventType:
+                                    'large_insertion',
+                                file: fileName,
+                                language,
+                                insertionSize:
+                                    charsAdded,
+                                charsDeleted
+                            });
+
+                            return;
+                        }
+
+                        // -----------------------------------------------------
+                        // Deletion
+                        // -----------------------------------------------------
+
+                        if (
+                            charsDeleted > 0 &&
+                            charsAdded === 0
+                        ) {
+                            recordEvent({
+                                timestamp:
+                                    new Date().toISOString(),
+                                eventType:
+                                    'deletion',
+                                file: fileName,
+                                language,
+                                deletionSize:
+                                    charsDeleted
+                            });
+
+                            return;
+                        }
+
+                        // -----------------------------------------------------
+                        // Normal edit
+                        // -----------------------------------------------------
+
+                        recordEvent({
+                            timestamp:
+                                new Date().toISOString(),
+                            eventType: 'edit',
+                            file: fileName,
+                            language,
+                            charsAdded,
+                            charsDeleted
+                        });
+                    }
+                );
             }
-        });
-    });
+        );
 
-    // ── LISTENER 2: Tab Switch ──
-    const tabChangeListener = vscode.window.onDidChangeActiveTextEditor((editor) => {
-        if (!loggingActive) {
-            return;
-        }
-        if (!editor || editor.document.uri.scheme !== 'file') {
-            return;
-        }
-        stats.tabSwitches += 1;
-        stats.filesTouched.add(path.basename(editor.document.fileName));
-    });
+    // ========================================================================
+    // LISTENER 2: ACTIVE EDITOR / TAB SWITCH
+    // ========================================================================
 
-    // ── LISTENER 3: File Save ──
-    const saveListener = vscode.workspace.onDidSaveTextDocument((document) => {
-        if (!loggingActive) {
-            return;
-        }
-        if (document.uri.scheme !== 'file') {
-            return;
-        }
-        stats.fileSaves += 1;
-        stats.filesTouched.add(path.basename(document.fileName));
-    });
+    const tabChangeListener =
+        vscode.window.onDidChangeActiveTextEditor(
+            (editor) => {
+                if (!loggingActive) {
+                    return;
+                }
 
-    // ── LISTENER 4: Debug Sessions ──
-    const debugStartListener = vscode.debug.onDidStartDebugSession(() => {
-        if (!loggingActive) return;
-        stats.debugSessionsStarted += 1;
-        noteRunEvent();
-    });
-    const debugEndListener = vscode.debug.onDidTerminateDebugSession(() => {
-        if (!loggingActive) return;
-        stats.debugSessionsEnded += 1;
-        flushStats('debug_session_end'); // flush immediately on meaningful boundary
-    });
+                if (
+                    !editor ||
+                    editor.document.uri.scheme !==
+                    'file'
+                ) {
+                    return;
+                }
 
-    // ── LISTENER 5: Task Execution ──
-    const taskStartListener = vscode.tasks.onDidStartTask(() => {
-        if (!loggingActive) return;
-        stats.tasksRun += 1;
-        noteRunEvent();
-    });
+                const fileName =
+                    fileNameFromDocument(
+                        editor.document
+                    );
 
-    // ── LISTENER 5b: Terminal shell execution (catches Code Runner & manual `python foo.py`,
-    // which don't go through the Tasks/Debug APIs above but are common in lab settings) ──
-    // Feature-detect: this API landed in VS Code 1.93 and older lab installs may not have it.
-    const anyWindow = vscode.window as any;
-    let terminalRunListener: vscode.Disposable | undefined;
-    if (typeof anyWindow.onDidStartTerminalShellExecution === 'function') {
-        terminalRunListener = anyWindow.onDidStartTerminalShellExecution(() => {
-            if (!loggingActive) return;
-            stats.tasksRun += 1;
-            noteRunEvent();
-        });
+                const language =
+                    languageFromDocument(
+                        editor.document
+                    );
+
+                stats.tabSwitches++;
+
+                stats.filesTouched.add(
+                    fileName
+                );
+
+                stats.languagesUsed.add(
+                    language
+                );
+
+                recordEvent({
+                    timestamp:
+                        new Date().toISOString(),
+                    eventType:
+                        'tab_switch',
+                    file: fileName,
+                    language
+                });
+            }
+        );
+
+    // ========================================================================
+    // LISTENER 3: FILE SAVE
+    // ========================================================================
+
+    const saveListener =
+        vscode.workspace.onDidSaveTextDocument(
+            (document) => {
+                if (!loggingActive) {
+                    return;
+                }
+
+                if (
+                    document.uri.scheme !==
+                    'file'
+                ) {
+                    return;
+                }
+
+                const fileName =
+                    fileNameFromDocument(
+                        document
+                    );
+
+                const language =
+                    languageFromDocument(
+                        document
+                    );
+
+                stats.fileSaves++;
+
+                stats.filesTouched.add(
+                    fileName
+                );
+
+                stats.languagesUsed.add(
+                    language
+                );
+
+                recordEvent({
+                    timestamp:
+                        new Date().toISOString(),
+                    eventType: 'save',
+                    file: fileName,
+                    language
+                });
+
+                captureCodeSnapshot(
+                    document,
+                    'save'
+                );
+            }
+        );
+
+    // ========================================================================
+    // LISTENER 3b: DOCUMENT CLOSE (final-state safety net)
+    // ========================================================================
+    //
+    // Fires when a file is closed, including as part of the window itself
+    // closing — this is what catches unsaved edits typed right before the
+    // student closes VS Code, which a save-only checkpoint would miss.
+
+    const closeListener =
+        vscode.workspace.onDidCloseTextDocument(
+            (document) => {
+                if (!loggingActive) {
+                    return;
+                }
+
+                captureCodeSnapshot(
+                    document,
+                    'file_close'
+                );
+            }
+        );
+
+    // ========================================================================
+    // LISTENER 4: DEBUG START
+    // ========================================================================
+
+    const debugStartListener =
+        vscode.debug.onDidStartDebugSession(
+            () => {
+                if (!loggingActive) {
+                    return;
+                }
+
+                stats.debugSessionsStarted++;
+
+                noteRunEvent();
+
+                recordEvent({
+                    timestamp:
+                        new Date().toISOString(),
+                    eventType:
+                        'debug_start'
+                });
+            }
+        );
+
+    // ========================================================================
+    // LISTENER 5: DEBUG END
+    // ========================================================================
+
+    const debugEndListener =
+        vscode.debug.onDidTerminateDebugSession(
+            () => {
+                if (!loggingActive) {
+                    return;
+                }
+
+                stats.debugSessionsEnded++;
+
+                recordEvent({
+                    timestamp:
+                        new Date().toISOString(),
+                    eventType:
+                        'debug_end'
+                });
+
+                flushStats(
+                    'debug_session_end'
+                );
+            }
+        );
+
+    // ========================================================================
+    // LISTENER 6: TASK EXECUTION
+    // ========================================================================
+
+    const taskStartListener =
+        vscode.tasks.onDidStartTask(
+            () => {
+                if (!loggingActive) {
+                    return;
+                }
+
+                stats.tasksRun++;
+
+                noteRunEvent();
+
+                recordEvent({
+                    timestamp:
+                        new Date().toISOString(),
+                    eventType:
+                        'task_start'
+                });
+            }
+        );
+
+    // ========================================================================
+    // LISTENER 7: TERMINAL EXECUTION
+    // ========================================================================
+
+    const anyWindow =
+        vscode.window as any;
+
+    let terminalRunListener:
+        vscode.Disposable | undefined;
+
+    if (
+        typeof anyWindow.onDidStartTerminalShellExecution ===
+        'function'
+    ) {
+        terminalRunListener =
+            anyWindow.onDidStartTerminalShellExecution(
+                () => {
+                    if (!loggingActive) {
+                        return;
+                    }
+
+                    stats.tasksRun++;
+                    stats.terminalRuns++;
+
+                    noteRunEvent();
+
+                    recordEvent({
+                        timestamp:
+                            new Date().toISOString(),
+                        eventType:
+                            'terminal_run'
+                    });
+                }
+            );
     } else {
-        outputChannel.appendLine('[info] onDidStartTerminalShellExecution unavailable on this VS Code version — Code Runner / manual terminal runs will not be logged. Update VS Code to 1.93+ to enable this.');
+        outputChannel.appendLine(
+            '[info] Terminal shell execution API unavailable. Update VS Code if terminal execution tracking is required.'
+        );
     }
 
-    // ── LISTENER 6: Git commits ──
-    setupGitListener(context);
+    // ========================================================================
+    // LISTENER 8: DIAGNOSTICS
+    // ========================================================================
 
-    // ── LISTENER 7: Window focus changes (proxy for "looked away") ──
-    const focusListener = vscode.window.onDidChangeWindowState((state) => {
-        if (!loggingActive) return;
-        const now = Date.now();
-        if (windowFocused && !state.focused) {
-            // just lost focus
-            windowFocused = false;
-            focusLostAt = now;
-        } else if (!windowFocused && state.focused) {
-            // just regained focus
-            windowFocused = true;
-            const lostMs = now - focusLostAt;
-            if (lostMs >= FOCUS_LOSS_MIN_MS) {
-                stats.focusLossCount += 1;
-                stats.totalFocusLossMs += lostMs;
+    const diagnosticListener =
+        vscode.languages.onDidChangeDiagnostics(
+            (event) => {
+                if (!loggingActive) {
+                    return;
+                }
+
+                for (const uri of event.uris) {
+                    if (
+                        uri.scheme !==
+                        'file'
+                    ) {
+                        continue;
+                    }
+
+                    const document =
+                        vscode.workspace.textDocuments
+                            .find(
+                                (doc) =>
+                                    doc.uri.toString() ===
+                                    uri.toString()
+                            );
+
+                    if (document) {
+                        collectDiagnosticsForDocument(
+                            document
+                        );
+                    }
+                }
             }
-        }
-    });
+        );
 
-    // ── Commands: let anyone stop/resume logging without uninstalling the extension ──
-    const stopCommand = vscode.commands.registerCommand('telemetryLogger.stopLogging', () => {
-        if (!loggingActive) {
-            vscode.window.showInformationMessage('Telemetry Logger is already stopped.');
-            return;
-        }
-        loggingActive = false;
-        flushStats('logging_stopped'); // save whatever was captured before stopping
-        outputChannel.appendLine('--- Logging stopped by user ---');
-        vscode.window.showInformationMessage('Telemetry Logger: logging stopped.');
-    });
-    const resumeCommand = vscode.commands.registerCommand('telemetryLogger.resumeLogging', () => {
-        if (loggingActive) {
-            vscode.window.showInformationMessage('Telemetry Logger is already running.');
-            return;
-        }
-        loggingActive = true;
-        stats = freshStats();
-        outputChannel.appendLine('--- Logging resumed by user ---');
-        vscode.window.showInformationMessage('Telemetry Logger: logging resumed.');
-    });
+    // ========================================================================
+    // LISTENER 9: WINDOW FOCUS
+    // ========================================================================
+
+    const focusListener =
+        vscode.window.onDidChangeWindowState(
+            (state) => {
+                if (!loggingActive) {
+                    return;
+                }
+
+                const now =
+                    Date.now();
+
+                if (
+                    windowFocused &&
+                    !state.focused
+                ) {
+                    windowFocused = false;
+                    focusLostAt = now;
+
+                    recordEvent({
+                        timestamp:
+                            new Date().toISOString(),
+                        eventType:
+                            'focus_loss'
+                    });
+                } else if (
+                    !windowFocused &&
+                    state.focused
+                ) {
+                    windowFocused = true;
+
+                    const lostMs =
+                        now -
+                        focusLostAt;
+
+                    if (
+                        lostMs >=
+                        FOCUS_LOSS_MIN_MS
+                    ) {
+                        stats.focusLossCount++;
+
+                        stats.totalFocusLossMs +=
+                            lostMs;
+
+                        recordEvent({
+                            timestamp:
+                                new Date().toISOString(),
+                            eventType:
+                                'focus_gain',
+                            durationMs:
+                                lostMs
+                        });
+                    }
+                }
+            }
+        );
+
+    // ========================================================================
+    // COMMAND: STOP LOGGING
+    // ========================================================================
+
+    const stopCommand =
+        vscode.commands.registerCommand(
+            'telemetryLogger.stopLogging',
+            () => {
+                if (!loggingActive) {
+                    vscode.window.showInformationMessage(
+                        'Telemetry Logger is already stopped.'
+                    );
+
+                    return;
+                }
+
+                loggingActive = false;
+
+                captureAllOpenDocuments(
+                    'session_stop'
+                );
+
+                flushStats(
+                    'logging_stopped'
+                );
+
+                outputChannel.appendLine(
+                    '--- Logging stopped by user ---'
+                );
+
+                vscode.window.showInformationMessage(
+                    'Telemetry Logger: logging stopped.'
+                );
+            }
+        );
+
+    // ========================================================================
+    // COMMAND: RESUME LOGGING
+    // ========================================================================
+
+    const resumeCommand =
+        vscode.commands.registerCommand(
+            'telemetryLogger.resumeLogging',
+            () => {
+                if (!consentGiven) {
+                    vscode.window.showWarningMessage(
+                        'Telemetry Logger: research consent has not been granted.'
+                    );
+
+                    return;
+                }
+
+                if (loggingActive) {
+                    vscode.window.showInformationMessage(
+                        'Telemetry Logger is already running.'
+                    );
+
+                    return;
+                }
+
+                loggingActive = true;
+
+                // A resumed period gets a fresh aggregation window.
+                stats = freshStats();
+
+                outputChannel.appendLine(
+                    '--- Logging resumed by user ---'
+                );
+
+                vscode.window.showInformationMessage(
+                    'Telemetry Logger: logging resumed.'
+                );
+            }
+        );
+
+    // ========================================================================
+    // COMMAND: CLEAR CONSENT
+    // ========================================================================
+
+    const clearConsentCommand =
+        vscode.commands.registerCommand(
+            'telemetryLogger.clearConsent',
+            async () => {
+                loggingActive = false;
+
+                await context.globalState.update(
+                    'telemetryLogger.consent',
+                    false
+                );
+
+                vscode.window.showInformationMessage(
+                    'Telemetry Logger consent cleared. Restart the extension to provide consent again.'
+                );
+            }
+        );
+
+    // ========================================================================
+    // REGISTER DISPOSABLES
+    // ========================================================================
 
     context.subscriptions.push(
         docChangeListener,
         tabChangeListener,
         saveListener,
+        closeListener,
         debugStartListener,
         debugEndListener,
         taskStartListener,
+        diagnosticListener,
         focusListener,
         stopCommand,
         resumeCommand,
-        { dispose: () => clearInterval(flushTimer) }
+        clearConsentCommand,
+        {
+            dispose: () => {
+                if (flushTimer) {
+                    clearInterval(
+                        flushTimer
+                    );
+                }
+            }
+        }
     );
+
     if (terminalRunListener) {
-        context.subscriptions.push(terminalRunListener);
+        context.subscriptions.push(
+            terminalRunListener
+        );
     }
+
+    // ========================================================================
+    // GIT
+    // ========================================================================
+
+    setupGitListener(context);
+
+    outputChannel.appendLine(
+        '--- Telemetry Logger Ready ---'
+    );
 }
 
-async function setupGitListener(context: vscode.ExtensionContext) {
-    const gitExtension = vscode.extensions.getExtension('vscode.git');
-    if (!gitExtension) {
-        outputChannel.appendLine('[git] built-in git extension not found — commit tracking disabled');
+// ============================================================================
+// GIT LISTENER
+// ============================================================================
+
+async function setupGitListener(
+    context: vscode.ExtensionContext
+): Promise<void> {
+    if (!loggingActive) {
         return;
     }
 
-    const git = gitExtension.isActive ? gitExtension.exports : await gitExtension.activate();
-    const api = git.getAPI(1);
-    const lastCommitHash = new Map<string, string>();
+    const gitExtension =
+        vscode.extensions.getExtension(
+            'vscode.git'
+        );
 
-    const attachRepo = (repo: any) => {
-        const rootPath = repo.rootUri.fsPath;
-        lastCommitHash.set(rootPath, repo.state.HEAD?.commit ?? '');
+    if (!gitExtension) {
+        outputChannel.appendLine(
+            '[git] built-in Git extension not found — commit tracking disabled'
+        );
 
-        const disposable = repo.state.onDidChange(() => {
-            const currentCommit = repo.state.HEAD?.commit;
-            const previousCommit = lastCommitHash.get(rootPath);
-            if (currentCommit && currentCommit !== previousCommit) {
-                lastCommitHash.set(rootPath, currentCommit);
-                stats.gitCommits += 1;
-                flushStats('git_commit'); // commits are meaningful — flush right away
-            }
-        });
-        context.subscriptions.push(disposable);
-    };
+        return;
+    }
 
-    api.repositories.forEach(attachRepo);
-    context.subscriptions.push(api.onDidOpenRepository(attachRepo));
+    try {
+        const git =
+            gitExtension.isActive
+                ? gitExtension.exports
+                : await gitExtension.activate();
+
+        const api =
+            git.getAPI(1);
+
+        const lastCommitHash =
+            new Map<string, string>();
+
+        const attachRepo = (
+            repo: any
+        ) => {
+            const rootPath =
+                repo.rootUri.fsPath;
+
+            lastCommitHash.set(
+                rootPath,
+                repo.state.HEAD?.commit ?? ''
+            );
+
+            const disposable =
+                repo.state.onDidChange(
+                    () => {
+                        if (!loggingActive) {
+                            return;
+                        }
+
+                        const currentCommit =
+                            repo.state.HEAD?.commit;
+
+                        const previousCommit =
+                            lastCommitHash.get(
+                                rootPath
+                            );
+
+                        if (
+                            currentCommit &&
+                            currentCommit !==
+                            previousCommit
+                        ) {
+                            lastCommitHash.set(
+                                rootPath,
+                                currentCommit
+                            );
+
+                            stats.gitCommits++;
+
+                            recordEvent({
+                                timestamp:
+                                    new Date().toISOString(),
+                                eventType:
+                                    'git_commit'
+                            });
+
+                            flushStats(
+                                'git_commit'
+                            );
+                        }
+                    }
+                );
+
+            context.subscriptions.push(
+                disposable
+            );
+        };
+
+        api.repositories.forEach(
+            attachRepo
+        );
+
+        context.subscriptions.push(
+            api.onDidOpenRepository(
+                attachRepo
+            )
+        );
+
+        outputChannel.appendLine(
+            '[git] commit tracking enabled'
+        );
+    } catch (error) {
+        outputChannel.appendLine(
+            `[git] failed to initialize Git tracking: ${
+                error instanceof Error
+                    ? error.message
+                    : String(error)
+            }`
+        );
+    }
 }
 
-export function deactivate() {
-    flushStats('deactivate');
+// ============================================================================
+// DEACTIVATE
+// ============================================================================
+
+export function deactivate(): void {
+    if (loggingActive) {
+        captureAllOpenDocuments('session_deactivate');
+
+        flushStats('deactivate');
+    }
+
     if (outputChannel) {
-        outputChannel.appendLine('--- Telemetry Logger Deactivated ---');
+        outputChannel.appendLine(
+            '--- Telemetry Logger Deactivated ---'
+        );
+
+        outputChannel.dispose();
     }
 }
