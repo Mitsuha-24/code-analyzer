@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { config } = require('./db');
+const { config } = require('./Db');
 const { ingestFile } = require('./ingest');
 
 const MAX_CONCURRENT = 4; // at exam end many students stop at once; never ingest more than this many at a time

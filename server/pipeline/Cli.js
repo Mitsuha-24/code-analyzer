@@ -3,7 +3,7 @@
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const { initDb, closeDb } = require('./Db');
-const { ingestFile } = require('./Ingest');
+const { ingestFile } = require('./ingest');
 const { ingestAll } = require('./hooks');
 const { norm } = require('./Transform');
 

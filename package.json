@@ -2,7 +2,7 @@
   "name": "telemetry-logger",
   "displayName": "telemetry-logger",
   "description": "Captures coding behavior telemetry for AI detection",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "mitsuha24",
   "license": "MIT",
   "repository": {

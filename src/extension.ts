@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as http from 'http';
 import * as https from 'https';
 import { randomUUID } from 'crypto';
+import { promptSessionTag } from './sessionlabel';
 
 // ============================================================================
 // CONFIGURATION
@@ -165,6 +166,7 @@ let consentGiven = false;
 
 let projectId = 'unknown';
 let taskId = 'unknown';
+let sessionLabel = 'unlabelled'; // 'human' | 'ai_assisted' | 'mixed' | 'unlabelled'
 
 const lastEditTimestamp = new Map<string, number>();
 
@@ -455,6 +457,7 @@ function buildSnapshotPayload(
 
         projectId,
         taskId,
+        label: sessionLabel,
 
         machineId: vscode.env.machineId,
 
@@ -800,7 +803,12 @@ function flushStats(reason: string): void {
         stats.diagnosticEvents > 0 ||
         stats.rawEvents.length > 0;
 
-    if (!hasActivity) {
+    // Session-ending flushes are always sent, even after a quiet minute, so the
+    // server always receives an end-of-session marker.
+    const isSessionEnd =
+        reason === 'logging_stopped' || reason === 'deactivate';
+
+    if (!hasActivity && !isSessionEnd) {
         return;
     }
 
@@ -855,6 +863,7 @@ function flushStats(reason: string): void {
 
         projectId,
         taskId,
+        label: sessionLabel,
 
         machineId: vscode.env.machineId,
 
@@ -1146,6 +1155,17 @@ export async function activate(
     taskId =
         await resolveTaskId();
 
+    // Ask for the ground-truth label + task BEFORE logging starts.
+    // Cancelling keeps the old behaviour but marks the session 'unlabelled'
+    // so it can be excluded from training.
+    const tag = await promptSessionTag();
+    if (tag) {
+        sessionLabel = tag.label;
+        taskId = tag.taskId;
+    } else {
+        sessionLabel = 'unlabelled';
+    }
+
     loggingActive = true;
 
     outputChannel.appendLine(
@@ -1162,6 +1182,10 @@ export async function activate(
 
     outputChannel.appendLine(
         `Task ID: ${taskId}`
+    );
+
+    outputChannel.appendLine(
+        `Session label: ${sessionLabel}`
     );
 
     // ---------------------------------------------------------
@@ -1815,8 +1839,8 @@ export async function activate(
                     return;
                 }
 
-                loggingActive = false;
-
+                // Order matters: flushStats() returns immediately once loggingActive
+                // is false, so flush first and switch logging off afterwards.
                 captureAllOpenDocuments(
                     'session_stop'
                 );
@@ -1824,6 +1848,8 @@ export async function activate(
                 flushStats(
                     'logging_stopped'
                 );
+
+                loggingActive = false;
 
                 outputChannel.appendLine(
                     '--- Logging stopped by user ---'

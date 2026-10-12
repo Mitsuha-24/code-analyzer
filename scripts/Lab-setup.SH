@@ -36,4 +36,4 @@ Remove-Item "C:\Users\Anushka\AppData\Roaming\Code\User\globalStorage\mitsuha24.
 
 # to run the server, run the following command in terminal:
  cd "D:\Code analyzer\telemetry-logger\server" 
- node server.js
+ node --env-file=.env server.js
